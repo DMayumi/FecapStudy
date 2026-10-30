@@ -1,3 +1,5 @@
 <Solution>
   <Project Path="FecapStudy/FecapStudy.csproj" />
+  <Project Path="FecapStudyUI/FecapStudyUI.csproj" />
+  <Project Path="Backend/Source/BackendEstudoAPI.csproj" />
 </Solution>

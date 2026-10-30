@@ -122,7 +122,7 @@ public class Program
             return Results.Created($"/api/disciplinas/{criada.Id}", criada);
         });
 
-        app.MapGet("/api/usuarios", (string perfil) => Results.Ok(banco.ListarUsuarios(perfil)));
+        app.MapGet("/api/usuarios", (string perfil = null) => Results.Ok(banco.ListarUsuarios(perfil)));
 
         app.MapPost("/api/usuarios", async (HttpContext ctx) =>
         {
@@ -135,26 +135,29 @@ public class Program
             return Results.Created($"/api/usuarios/{criado.Id}", criado);
         });
 
-        app.MapGet("/api/sessoes", (string discente) => Results.Ok(banco.ListarSessoes(discente)));
+        app.MapGet("/api/sessoes", (string discente = null) => Results.Ok(banco.ListarSessoes(discente)));
 
         app.MapPost("/api/sessoes", async (HttpContext ctx) =>
         {
             var dto = await JsonSerializer.DeserializeAsync<SessaoEstudoDto>(ctx.Request.Body, JsonOpts.Padrao);
-            if (dto == null || string.IsNullOrWhiteSpace(dto.DiscenteNome) || dto.DuracaoMinutos <= 0)
-                return Results.BadRequest(new { erro = "Informe 'discenteNome', 'disciplina' e 'duracaoMinutos' (> 0)." });
+            if (dto == null || string.IsNullOrWhiteSpace(dto.DiscenteNome) || string.IsNullOrWhiteSpace(dto.Disciplina)
+                || dto.DuracaoMinutos <= 0 || dto.DuracaoMinutos > 480 || dto.XpGanho < 0)
+                return Results.BadRequest(new { erro = "Informe discente, disciplina, duração de 1 a 480 minutos e XP não negativo." });
 
             var criada = banco.InserirSessao(dto);
             LogConsole("POST /api/sessoes", $"{criada.DiscenteNome} estudou {criada.Disciplina} ({criada.TipoModalidade}, {criada.DuracaoMinutos} min) -> +{criada.XpGanho} XP");
             return Results.Created($"/api/sessoes/{criada.Id}", criada);
         });
 
-        app.MapGet("/api/metas", (string discente) => Results.Ok(banco.ListarMetas(discente)));
+        app.MapGet("/api/metas", (string discente = null) => Results.Ok(banco.ListarMetas(discente)));
 
         app.MapPost("/api/metas", async (HttpContext ctx) =>
         {
             var dto = await JsonSerializer.DeserializeAsync<MetaEstudoDto>(ctx.Request.Body, JsonOpts.Padrao);
             if (dto == null || string.IsNullOrWhiteSpace(dto.DiscenteNome) || dto.MetaMinutosSemana <= 0)
                 return Results.BadRequest(new { erro = "Informe 'discenteNome', 'responsavelNome' e 'metaMinutosSemana' (> 0)." });
+
+            dto.MetaMinutosSemana = Math.Clamp(dto.MetaMinutosSemana, 30, 3000);
 
             var criada = banco.InserirOuAtualizarMeta(dto);
             LogConsole("POST /api/metas", $"Meta para {criada.DiscenteNome} por {criada.ResponsavelNome}: {criada.MetaMinutosSemana} min/semana");
@@ -473,7 +476,7 @@ public class BancoGerenciador
             Online = true,
             UsandoMySql = UsandoMySql,
             ModoBanco = UsandoMySql ? "MySQL (fecap_estudo)" : "JSON Local (Fallback Automático)",
-            StringConexaoMascarada = connStr,
+            StringConexaoMascarada = new MySqlConnectionStringBuilder(connStr) { Password = "***" }.ConnectionString,
             UltimoErroMySql = UltimoErroMySql,
             TotalUsuarios = usuarios.Count,
             TotalDisciplinas = disciplinas.Count,
@@ -637,7 +640,7 @@ public class BancoGerenciador
         }
         if (!string.IsNullOrWhiteSpace(discente))
         {
-            lista = lista.Where(s => s.DiscenteNome.Contains(discente, StringComparison.OrdinalIgnoreCase)).ToList();
+            lista = lista.Where(s => string.Equals(s.DiscenteNome, discente, StringComparison.OrdinalIgnoreCase)).ToList();
         }
         return lista;
     }
@@ -656,11 +659,14 @@ public class BancoGerenciador
             {
                 using var conn = new MySqlConnection(connStr);
                 conn.Open();
-                dto.Id = InserirSessaoMySql(conn, dto);
-                using var cmdUpMeta = new MySqlCommand("UPDATE metas_estudo SET minutos_cumpridos = minutos_cumpridos + @min WHERE discente_nome = @disc;", conn);
+                // A sessão e o avanço da meta são gravados juntos.
+                using var transacao = conn.BeginTransaction();
+                dto.Id = InserirSessaoMySql(conn, dto, transacao);
+                using var cmdUpMeta = new MySqlCommand("UPDATE metas_estudo SET minutos_cumpridos = minutos_cumpridos + @min WHERE discente_nome = @disc;", conn, transacao);
                 cmdUpMeta.Parameters.AddWithValue("@min", dto.DuracaoMinutos);
                 cmdUpMeta.Parameters.AddWithValue("@disc", dto.DiscenteNome);
                 cmdUpMeta.ExecuteNonQuery();
+                transacao.Commit();
                 return dto;
             }
             catch (Exception ex) { UsandoMySql = false; UltimoErroMySql = ex.Message; }
@@ -674,9 +680,9 @@ public class BancoGerenciador
         return dto;
     }
 
-    private int InserirSessaoMySql(MySqlConnection conn, SessaoEstudoDto s)
+    private int InserirSessaoMySql(MySqlConnection conn, SessaoEstudoDto s, MySqlTransaction transacao = null)
     {
-        using var cmd = new MySqlCommand("INSERT INTO sessoes_estudo (discente_nome, disciplina, tipo_modalidade, duracao_minutos, xp_ganho, resumo_feedback, data_registro) VALUES (@dn, @di, @tm, @du, @xp, @rf, @dr); SELECT LAST_INSERT_ID();", conn);
+        using var cmd = new MySqlCommand("INSERT INTO sessoes_estudo (discente_nome, disciplina, tipo_modalidade, duracao_minutos, xp_ganho, resumo_feedback, data_registro) VALUES (@dn, @di, @tm, @du, @xp, @rf, @dr); SELECT LAST_INSERT_ID();", conn, transacao);
         cmd.Parameters.AddWithValue("@dn", s.DiscenteNome ?? "");
         cmd.Parameters.AddWithValue("@di", s.Disciplina ?? "");
         cmd.Parameters.AddWithValue("@tm", s.TipoModalidade ?? "Pomodoro");
@@ -715,7 +721,7 @@ public class BancoGerenciador
         }
         if (!string.IsNullOrWhiteSpace(discente))
         {
-            lista = lista.Where(m => m.DiscenteNome.Contains(discente, StringComparison.OrdinalIgnoreCase)).ToList();
+            lista = lista.Where(m => string.Equals(m.DiscenteNome, discente, StringComparison.OrdinalIgnoreCase)).ToList();
         }
         return lista;
     }
@@ -750,6 +756,20 @@ public class BancoGerenciador
 
     private int InserirMetaMySql(MySqlConnection conn, MetaEstudoDto m)
     {
+        // Alterar a meta do mesmo discente não cria outra linha nem apaga seu avanço.
+        using var buscar = new MySqlCommand("SELECT id FROM metas_estudo WHERE discente_nome = @dn ORDER BY id LIMIT 1;", conn);
+        buscar.Parameters.AddWithValue("@dn", m.DiscenteNome);
+        object idExistente = buscar.ExecuteScalar();
+        if (idExistente != null)
+        {
+            using var atualizar = new MySqlCommand("UPDATE metas_estudo SET responsavel_nome = @rn, meta_minutos_semana = @mm WHERE id = @id;", conn);
+            atualizar.Parameters.AddWithValue("@rn", m.ResponsavelNome ?? "");
+            atualizar.Parameters.AddWithValue("@mm", m.MetaMinutosSemana);
+            atualizar.Parameters.AddWithValue("@id", Convert.ToInt32(idExistente));
+            atualizar.ExecuteNonQuery();
+            return Convert.ToInt32(idExistente);
+        }
+
         using var cmd = new MySqlCommand("INSERT INTO metas_estudo (discente_nome, responsavel_nome, meta_minutos_semana, minutos_cumpridos) VALUES (@dn, @rn, @mm, @mc); SELECT LAST_INSERT_ID();", conn);
         cmd.Parameters.AddWithValue("@dn", m.DiscenteNome ?? "");
         cmd.Parameters.AddWithValue("@rn", m.ResponsavelNome ?? "");
